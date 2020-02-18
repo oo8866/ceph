@@ -4,10 +4,11 @@ import logging
 import time
 from threading import Event
 from functools import wraps
+from collections import namedtuple
 
 import string
 try:
-    from typing import List, Dict, Optional, Callable, Tuple, TypeVar, Type, Any
+    from typing import List, Dict, Optional, Callable, Tuple, TypeVar, Type, Any, Datetime
     from typing import TYPE_CHECKING
 except ImportError:
     TYPE_CHECKING = False  # just for type checking
@@ -402,6 +403,8 @@ class CephadmOrchestrator(MgrModule, orchestrator.OrchestratorClientMixin):
             self.inventory = dict()
         self.log.debug('Loaded inventory %s' % self.inventory)
 
+        self.to_remove_osds: set = set()
+
         # The values are cached by instance.
         # cache is invalidated by
         # 1. timeout
@@ -764,6 +767,7 @@ class CephadmOrchestrator(MgrModule, orchestrator.OrchestratorClientMixin):
         self.log.info("serve starting")
         while self.run:
             self._check_hosts()
+            self._remove_osds_bg()
 
             # refresh daemons
             self.log.debug('refreshing daemons')
@@ -2332,6 +2336,168 @@ scrape_configs:
         self.event.set()
         return trivial_result('Stopped upgrade to %s' % target_name)
 
+    @with_daemons('osd')
+    def remove_osds(self, osd_ids: list,
+                    replace: bool,
+                    force: bool,
+                    daemons: List[orchestrator.DaemonDescription]):
+        # TODO: remove me
+        #osd_spec = namedtuple('OSD', ['osd_id', 'replace', 'force', 'nodename', 'fullname', 'started_at'])
+
+        from typing import NamedTuple
+
+        class OSDRemoval(NamedTuple):
+            osd_id: int
+            replace: bool
+            force: bool
+            nodename: str
+            fullname: str
+            started_at: str
+
+            def __eq__(self, other):
+                return self.osd_id == other.osd_id
+
+            def __hash__(self):
+                return hash(self.osd_id)
+
+        found = set()
+        for daemon in daemons:
+            if daemon.daemon_id not in osd_ids:
+                continue
+            found.add(OSDRemoval(daemon.daemon_id, replace, force,
+                                 daemon.nodename, daemon.name(),
+                                 datetime.datetime.utcnow()))
+
+        not_found = {osd_id for osd_id in osd_ids if osd_id not in [x.osd_id for x in found]}
+        if not_found:
+            raise OrchestratorError('Unable to find OSD: %s' % not_found)
+
+        for osd in found:
+            self.log.debug(f"OSD(s) scheduled for removal: {self.to_remove_osds}")
+            self.log.debug(f"Looking at OSD: {osd}")
+            if osd in self.to_remove_osds:
+                continue
+            self.log.info(f"Scheduling OSDs {osd.osd_id} for removal")
+            self.to_remove_osds.add(osd)
+            # trigger the serve loop to initiate the removal
+            self._kick_serve_loop()
+        return trivial_result(f"Scheduled OSD(s) {osd_ids} for removal")
+
+    def _remove_osds_bg(self):
+        # type: () -> Optional[bool]
+
+        self.log.debug(f"{len(self.to_remove_osds)} OSDs are scheduled for removal: {list(self.to_remove_osds)}")
+        remove_osds = self.to_remove_osds.copy()
+        for osd in remove_osds:
+            if not osd.force:
+                # skip criteria
+                if not self.is_empty(osd.osd_id):
+                    self.log.info(f"OSD <{osd.osd_id}> is not empty yet. Waiting a bit more")
+                    continue
+
+            if not self.ok_to_destroy([osd.osd_id]):
+                self.log.info(f"OSD <{osd.osd_id}> is not safe-to-destroy yet. Waiting a bit more")
+                continue
+
+            # abort criteria
+            if not self.down_osd([osd.osd_id]):
+                # also remove it from the remove_osd list and set a health_check warning?
+                raise orchestrator.OrchestratorError(f"Could not set OSD <{osd.osd_id}> to 'down'")
+
+            if osd.replace:
+                if not self.destroy_osd(osd.osd_id):
+                    # also remove it from the remove_osd list and set a health_check warning?
+                    raise orchestrator.OrchestratorError(f"Could not destroy OSD <{osd.osd_id}>")
+            else:
+                if not self.purge_osd(osd.osd_id):
+                    # also remove it from the remove_osd list and set a health_check warning?
+                    raise orchestrator.OrchestratorError(f"Could not purge OSD <{osd.osd_id}>")
+
+            completion = self._remove_daemon([(osd.fullname, osd.nodename)], force=True)
+            if completion:
+                # so, if this is a asynccompletion.. I probably have to wait for it.. or it needs to be the
+                # last operation? or work with .then.. but it must not be blocking io..
+                self._orchestrator_wait([completion])
+                orchestrator.raise_if_exception(completion)
+                self.log.debug('services %s' % completion.result)
+            else:
+                self.log.error('No completion object from _remove_daemon received')
+                raise orchestrator.OrchestratorError(f"Could not remove daemon for OSD <{osd.osd_id}>")
+
+            self.log.info(f"Successfully removed removed OSD <{osd.osd_id}> on {osd.nodename}")
+            self.log.debug(f"Removing {osd.osd_id} from the queue.")
+            self.to_remove_osds.remove(osd)
+            completion.add_progress('Removing OSDs', self)
+            completion.update_progress = True
+        return True
+
+    def get_pg_count(self, osd_id: str) -> int:
+        # MONKEYPATCH
+        return 1
+        # MONKEYPATCH
+        ret, out, err = self.mon_command({
+            'prefix': 'osd drain status',
+        })
+        # this is probably str? implement a json format type in osd drain status
+        if ret != 0:
+            self.log.error(f"Calling osd drain status failed with {err}")
+            raise OrchestratorError("Could not query `osd drain status`")
+        for o in out:
+            if o.get('osd_id', '') == str(osd_id):
+                # is this str also?
+                return int(o.get('pgs'))
+
+    def is_empty(self, osd_id: str) -> bool:
+        return self.get_pg_count(osd_id) == 0
+
+    def ok_to_destroy(self, osd_ids: List[int]) -> bool:
+        cmd_args = {'prefix': 'osd safe-to-destroy',
+                    'ids': osd_ids}
+        return self._run_mon_cmd(cmd_args)
+
+    def destroy_osd(self, osd_id: int) -> bool:
+        cmd_args = {'prefix': 'osd destroy-actual',
+                    'id': int(osd_id),
+                    'yes_i_really_mean_it': True}
+        return self._run_mon_cmd(cmd_args)
+
+    def down_osd(self, osd_ids: List[int]) -> bool:
+        cmd_args = {
+            'prefix': 'osd down',
+            'ids': osd_ids,
+        }
+        return self._run_mon_cmd(cmd_args)
+
+    def purge_osd(self, osd_id: int) -> bool:
+        cmd_args = {
+            'prefix': 'osd purge-actual',
+            'id': int(osd_id),
+            'yes_i_really_mean_it': True
+        }
+        return self._run_mon_cmd(cmd_args)
+
+    def out_osd(self, osd_ids: List[int]) -> bool:
+        cmd_args = {
+            'prefix': 'osd out',
+            'ids': osd_ids,
+        }
+        return self._run_mon_cmd(cmd_args)
+
+    def _run_mon_cmd(self, cmd_args: dict) -> bool:
+        ret, out, err = self.mon_command(cmd_args)
+        if ret != 0:
+            self.log.debug(f"ran {cmd_args} with mon_command")
+            self.log.error(f"cmd: {cmd_args.get('prefix')} failed with: {err}. (errno:{ret})")
+            return False
+        self.log.debug(f"cmd: {cmd_args.get('prefix')} returns: {out}")
+        return True
+
+    def remove_osds_status(self):
+        report = {}
+        for osd in self.to_remove_osds:
+            pg_count = self.get_pg_count(osd.osd_id)
+            report[osd] = pg_count
+        return trivial_result(report)
 
 class BaseScheduler(object):
     """
