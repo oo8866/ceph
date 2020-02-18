@@ -8,13 +8,13 @@ from collections import namedtuple
 
 import string
 try:
-    from typing import List, Dict, Optional, Callable, Tuple, TypeVar, Type, Any, Datetime
+    from typing import List, Dict, Optional, Callable, Tuple, TypeVar, Type, Any, NamedTuple
     from typing import TYPE_CHECKING
 except ImportError:
     TYPE_CHECKING = False  # just for type checking
 
 
-import datetime
+from datetime import date, datetime
 import six
 import os
 import random
@@ -1286,7 +1286,7 @@ class CephadmOrchestrator(MgrModule, orchestrator.OrchestratorClientMixin):
             host, 'mon', 'ls', [], no_fsid=True)
         data = json.loads(''.join(out))
         for d in data:
-            d['last_refresh'] = datetime.datetime.utcnow().strftime(DATEFMT)
+            d['last_refresh'] = datetime.utcnow().strftime(DATEFMT)
         self.log.debug('Refreshed host %s daemons: %s' % (host, data))
         self.daemon_cache[host] = orchestrator.OutdatableData(data)
         return host, data
@@ -1341,7 +1341,7 @@ class CephadmOrchestrator(MgrModule, orchestrator.OrchestratorClientMixin):
                     self.log.debug('including %s %s' % (host, d))
                     sd = orchestrator.DaemonDescription()
                     if 'last_refresh' in d:
-                        sd.last_refresh = datetime.datetime.strptime(
+                        sd.last_refresh = datetime.strptime(
                             d['last_refresh'], DATEFMT)
                     if '.' not in d['name']:
                         self.log.debug('ignoring dot-less daemon on %s: %s' % (host, d))
@@ -2341,10 +2341,6 @@ scrape_configs:
                     replace: bool,
                     force: bool,
                     daemons: List[orchestrator.DaemonDescription]):
-        # TODO: remove me
-        #osd_spec = namedtuple('OSD', ['osd_id', 'replace', 'force', 'nodename', 'fullname', 'started_at'])
-
-        from typing import NamedTuple
 
         class OSDRemoval(NamedTuple):
             osd_id: int
@@ -2352,7 +2348,7 @@ scrape_configs:
             force: bool
             nodename: str
             fullname: str
-            started_at: str
+            started_at: date
 
             def __eq__(self, other):
                 return self.osd_id == other.osd_id
@@ -2366,22 +2362,17 @@ scrape_configs:
                 continue
             found.add(OSDRemoval(daemon.daemon_id, replace, force,
                                  daemon.nodename, daemon.name(),
-                                 datetime.datetime.utcnow()))
+                                 datetime.utcnow()))
 
         not_found = {osd_id for osd_id in osd_ids if osd_id not in [x.osd_id for x in found]}
         if not_found:
             raise OrchestratorError('Unable to find OSD: %s' % not_found)
 
         for osd in found:
-            self.log.debug(f"OSD(s) scheduled for removal: {self.to_remove_osds}")
-            self.log.debug(f"Looking at OSD: {osd}")
-            if osd in self.to_remove_osds:
-                continue
-            self.log.info(f"Scheduling OSDs {osd.osd_id} for removal")
             self.to_remove_osds.add(osd)
             # trigger the serve loop to initiate the removal
             self._kick_serve_loop()
-        return trivial_result(f"Scheduled OSD(s) {osd_ids} for removal")
+        return trivial_result(f"Scheduled OSD(s) for removal")
 
     def _remove_osds_bg(self):
         # type: () -> Optional[bool]
